@@ -24,6 +24,7 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 from framework.graph.conversation import ConversationStore, NodeConversation
 from framework.graph.node import NodeContext, NodeProtocol, NodeResult
+from framework.graph.validator import OutputValidator
 from framework.llm.provider import Tool, ToolResult, ToolUse
 from framework.llm.stream_events import (
     FinishEvent,
@@ -383,6 +384,9 @@ class EventLoopNode(NodeProtocol):
 
         # Verdict counters for runtime logging
         _accept_count = _retry_count = _escalate_count = _continue_count = 0
+
+        # Tracks how many times output_model validation has failed and retried
+        _validation_retry_count = 0
 
         # Client-facing auto-block grace: consecutive text-only turns without
         # any real tool call or set_output.  Resets on progress.
@@ -1528,6 +1532,109 @@ class EventLoopNode(NodeProtocol):
                             latency_ms=iter_latency_ms,
                         )
                     continue
+
+                # Validate accumulated outputs against output_model if specified.
+                # This is the wiring that makes the NodeSpec.output_model field
+                # actually enforce structured-output correctness.  Nodes without
+                # output_model are completely unaffected.
+                if ctx.node_spec.output_model is not None:
+                    _validator = OutputValidator()
+                    val_result, _ = _validator.validate_with_pydantic(
+                        accumulator.to_dict(), ctx.node_spec.output_model
+                    )
+                    if not val_result.success:
+                        if _validation_retry_count < ctx.node_spec.max_validation_retries:
+                            _validation_retry_count += 1
+                            feedback = _validator.format_validation_feedback(
+                                val_result, ctx.node_spec.output_model
+                            )
+                            logger.info(
+                                "[%s] iter=%d: output_model validation failed "
+                                "(attempt %d/%d): %s",
+                                node_id,
+                                iteration,
+                                _validation_retry_count,
+                                ctx.node_spec.max_validation_retries,
+                                val_result.error,
+                            )
+                            await conversation.add_user_message(
+                                f"[Output validation failed]: {feedback}"
+                            )
+                            _retry_count += 1
+                            if ctx.runtime_logger:
+                                iter_latency_ms = int((time.time() - iter_start) * 1000)
+                                ctx.runtime_logger.log_step(
+                                    node_id=node_id,
+                                    node_type="event_loop",
+                                    step_index=iteration,
+                                    verdict="RETRY",
+                                    verdict_feedback=(
+                                        f"output_model validation failed: {val_result.error}"
+                                    ),
+                                    tool_calls=logged_tool_calls,
+                                    llm_text=assistant_text,
+                                    input_tokens=turn_tokens.get("input", 0),
+                                    output_tokens=turn_tokens.get("output", 0),
+                                    latency_ms=iter_latency_ms,
+                                )
+                            continue
+                        else:
+                            # Retries exhausted — escalate with structured error detail.
+                            logger.warning(
+                                "[%s] iter=%d: output_model validation exhausted %d retries, escalating",
+                                node_id,
+                                iteration,
+                                ctx.node_spec.max_validation_retries,
+                            )
+                            await self._publish_loop_completed(
+                                stream_id, node_id, iteration + 1, execution_id
+                            )
+                            latency_ms = int((time.time() - start_time) * 1000)
+                            _escalate_count += 1
+                            escalate_reason = (
+                                f"output_model validation failed after "
+                                f"{ctx.node_spec.max_validation_retries} retries: "
+                                f"{val_result.error}"
+                            )
+                            if ctx.runtime_logger:
+                                iter_latency_ms = int((time.time() - iter_start) * 1000)
+                                ctx.runtime_logger.log_step(
+                                    node_id=node_id,
+                                    node_type="event_loop",
+                                    step_index=iteration,
+                                    verdict="ESCALATE",
+                                    verdict_feedback=escalate_reason,
+                                    tool_calls=logged_tool_calls,
+                                    llm_text=assistant_text,
+                                    input_tokens=turn_tokens.get("input", 0),
+                                    output_tokens=turn_tokens.get("output", 0),
+                                    latency_ms=iter_latency_ms,
+                                )
+                                ctx.runtime_logger.log_node_complete(
+                                    node_id=node_id,
+                                    node_name=ctx.node_spec.name,
+                                    node_type="event_loop",
+                                    success=False,
+                                    error=escalate_reason,
+                                    total_steps=iteration + 1,
+                                    tokens_used=total_input_tokens + total_output_tokens,
+                                    input_tokens=total_input_tokens,
+                                    output_tokens=total_output_tokens,
+                                    latency_ms=latency_ms,
+                                    exit_status="escalated",
+                                    accept_count=_accept_count,
+                                    retry_count=_retry_count,
+                                    escalate_count=_escalate_count,
+                                    continue_count=_continue_count,
+                                )
+                            return NodeResult(
+                                success=False,
+                                error=escalate_reason,
+                                output=accumulator.to_dict(),
+                                tokens_used=total_input_tokens + total_output_tokens,
+                                latency_ms=latency_ms,
+                                conversation=conversation if _is_continuous else None,
+                            )
 
                 # Exit point 5: Judge ACCEPT — log step + log_node_complete
                 # Write outputs to shared memory

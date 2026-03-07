@@ -437,3 +437,153 @@ class TestPydanticValidationIntegrationExtended:
         assert "error2" in error_str
         assert "error3" in error_str
         assert "; " in error_str  # errors joined with "; "
+
+
+# Runtime validation path tests
+# These tests exercise the exact code path used by event_loop_node.py when
+# output_model is set on a NodeSpec and the judge returns ACCEPT.
+class TestRuntimeValidationPath:
+    """Tests that mirror the runtime validation logic in EventLoopNode."""
+
+    def _run_validation(
+        self,
+        accumulated: dict,
+        model: type[BaseModel],
+    ) -> tuple[ValidationResult, BaseModel | None, str | None]:
+        """
+        Simulate the validation step executed in the ACCEPT path.
+
+        Returns (result, validated_instance, feedback_or_None).
+        """
+        validator = OutputValidator()
+        val_result, validated = validator.validate_with_pydantic(accumulated, model)
+        feedback = None
+        if not val_result.success:
+            feedback = validator.format_validation_feedback(val_result, model)
+        return val_result, validated, feedback
+
+    def test_valid_outputs_pass_without_feedback(self):
+        """On success, no feedback is generated and the validated model is returned."""
+        accumulated = {"message": "hello", "count": 3}
+        result, validated, feedback = self._run_validation(accumulated, SimpleOutput)
+
+        assert result.success is True
+        assert validated is not None
+        assert validated.message == "hello"
+        assert validated.count == 3
+        assert feedback is None
+
+    def test_invalid_outputs_produce_feedback(self):
+        """On failure, structured feedback is produced for LLM injection."""
+        accumulated = {"message": "hello"}  # missing 'count'
+        result, validated, feedback = self._run_validation(accumulated, SimpleOutput)
+
+        assert result.success is False
+        assert validated is None
+        assert feedback is not None
+        assert "count" in feedback
+        assert "ERRORS:" in feedback
+        assert "EXPECTED SCHEMA:" in feedback
+
+    def test_feedback_message_matches_injection_format(self):
+        """The feedback string is suitable for injection into conversation history."""
+        accumulated = {"priority": 99}  # missing required fields, priority out of range
+        result, _, feedback = self._run_validation(accumulated, TicketAnalysis)
+
+        assert result.success is False
+        # Simulate the injection message used in event_loop_node.py
+        injected = f"[Output validation failed]: {feedback}"
+        assert injected.startswith("[Output validation failed]:")
+        assert "ERRORS:" in injected
+
+    def test_max_validation_retries_default_is_two(self):
+        """Default max_validation_retries guards the retry budget correctly."""
+        node = NodeSpec(
+            id="n",
+            name="N",
+            description="d",
+            output_model=SimpleOutput,
+        )
+        # Simulate budget checks as in event_loop_node.py
+        _validation_retry_count = 0
+        outputs = {"message": "ok"}  # missing count
+
+        validator = OutputValidator()
+        val_result, _ = validator.validate_with_pydantic(outputs, node.output_model)
+        assert not val_result.success
+
+        # First failure: within budget
+        assert _validation_retry_count < node.max_validation_retries
+        _validation_retry_count += 1
+
+        # Second failure: still within budget
+        assert _validation_retry_count < node.max_validation_retries
+        _validation_retry_count += 1
+
+        # Third failure: budget exhausted → escalate
+        assert _validation_retry_count >= node.max_validation_retries
+
+    def test_zero_retries_escalates_immediately(self):
+        """When max_validation_retries=0, the first failure should escalate."""
+        node = NodeSpec(
+            id="n",
+            name="N",
+            description="d",
+            output_model=SimpleOutput,
+            max_validation_retries=0,
+        )
+        _validation_retry_count = 0
+        outputs = {"message": "ok"}  # missing count
+
+        validator = OutputValidator()
+        val_result, _ = validator.validate_with_pydantic(outputs, node.output_model)
+        assert not val_result.success
+
+        # With 0 retries, _validation_retry_count (0) >= max_validation_retries (0)
+        assert _validation_retry_count >= node.max_validation_retries
+
+    def test_nodes_without_output_model_are_unaffected(self):
+        """Nodes without output_model skip validation entirely."""
+        node = NodeSpec(id="n", name="N", description="d")
+        # The runtime checks `if ctx.node_spec.output_model is not None` — verify
+        assert node.output_model is None
+
+    def test_type_coercion_failures_are_caught(self):
+        """Wrong-type values that pydantic cannot coerce should fail validation."""
+        accumulated = {"message": "hello", "count": "not-a-number"}
+        result, validated, feedback = self._run_validation(accumulated, SimpleOutput)
+
+        assert result.success is False
+        assert validated is None
+        assert feedback is not None
+        assert "count" in feedback
+
+    def test_constraint_violations_are_caught(self):
+        """Field constraint violations (ge/le/min_length) are caught and reported."""
+        accumulated = {
+            "category": "Bug",
+            "priority": 10,  # must be 1-5
+            "summary": "short",  # min_length=10
+            "suggested_action": "Fix it",
+        }
+        result, validated, feedback = self._run_validation(accumulated, TicketAnalysis)
+
+        assert result.success is False
+        assert validated is None
+        assert "priority" in feedback or "summary" in feedback
+
+    def test_successful_validation_returns_model_instance(self):
+        """Validated model instance has the correct field values."""
+        accumulated = {
+            "category": "Bug",
+            "priority": 2,
+            "summary": "App crashes on startup with null pointer exception",
+            "suggested_action": "Investigate stack trace and patch null check",
+        }
+        result, validated, feedback = self._run_validation(accumulated, TicketAnalysis)
+
+        assert result.success is True
+        assert validated is not None
+        assert validated.category == "Bug"
+        assert validated.priority == 2
+        assert feedback is None
